@@ -4,73 +4,215 @@ Provides tools to connect to clients and control media playback.
 """
 import json
 import time
-from typing import List, Dict, Optional, Union, Any
+import asyncio
+from typing import List, Dict, Optional, Union, Any, Tuple
 
 from modules import mcp, connect_to_plex
 from plexapi.exceptions import NotFound, Unauthorized
+from plexapi.client import PlexClient
+
+
+def _find_client(plex, client_identifier: str) -> Tuple[Optional[Any], Optional[Any], str]:
+    """Find a client by name or machineIdentifier and return a controllable client.
+
+    Uses myPlexAccount.resources() to discover both idle and active players,
+    then connects directly via IP for control.
+
+    Args:
+        plex: PlexServer instance
+        client_identifier: Client name or machineIdentifier
+        
+    Returns:
+        Tuple of (client, session, client_name) where:
+        - client: The controllable PlexClient if found, None otherwise
+        - session: The active session if found, None otherwise  
+        - client_name: The display name of the client found
+    """
+    plex_token = plex._token
+    session = None
+    
+    # Check if there's an active session for this client
+    sessions = plex.sessions()
+    session_addresses = {}
+    for s in sessions:
+        if hasattr(s, 'player') and s.player:
+            player = s.player
+            player_title = getattr(player, 'title', '')
+            player_machine_id = getattr(player, 'machineIdentifier', '')
+            player_address = getattr(player, 'address', '')
+            
+            if (client_identifier.lower() in player_title.lower() or 
+                client_identifier.lower() == player_machine_id.lower()):
+                session = s
+                # If we have an address from the session, use it directly
+                if player_address:
+                    try:
+                        client = PlexClient(
+                            baseurl=f"http://{player_address}:32500",
+                            token=plex_token,
+                            server=plex
+                        )
+                        return client, s, player_title
+                    except Exception:
+                        pass
+            # Store session addresses for later matching
+            if player_machine_id:
+                session_addresses[player_machine_id] = (player_address, s, player_title)
+    
+    # Use myPlexAccount.resources() to find idle/available players
+    try:
+        account = plex.myPlexAccount()
+        resources = account.resources()
+        
+        for resource in resources:
+            provides = getattr(resource, 'provides', '') or ''
+            # Only consider resources that provide player capability
+            if 'player' not in provides.lower():
+                continue
+            
+            resource_name = getattr(resource, 'name', '')
+            resource_id = getattr(resource, 'clientIdentifier', '')
+            
+            if (client_identifier.lower() in resource_name.lower() or 
+                client_identifier.lower() == resource_id.lower()):
+                
+                # Get local connection URI
+                if hasattr(resource, 'connections') and resource.connections:
+                    for conn in resource.connections:
+                        # Prefer local connections
+                        if getattr(conn, 'local', False):
+                            uri = getattr(conn, 'uri', '')
+                            if uri:
+                                try:
+                                    client = PlexClient(
+                                        baseurl=uri,
+                                        token=plex_token,
+                                        server=plex
+                                    )
+                                    # Check if there's a matching session
+                                    matched_session = session_addresses.get(resource_id, (None, None, None))[1]
+                                    return client, matched_session, resource_name
+                                except Exception:
+                                    pass
+                
+                # Resource found but no controllable connection
+                return None, session, resource_name
+    except Exception:
+        pass
+    
+    return None, session, None
 
 @mcp.tool()
-async def client_list(include_details: bool = True) -> str:
-    """List all available Plex clients connected to the server.
+async def client_list(include_details: bool = True, active_only: bool = False) -> str:
+    """List all available Plex clients including idle players.
+    
+    Uses myPlexAccount.resources() to discover all players (both active and idle),
+    not just those with active sessions.
     
     Args:
         include_details: Whether to include detailed information about each client
+        active_only: If True, only return clients that are currently playing or paused
     
     Returns:
-        List of client names or detailed info dictionaries
+        List of clients with user info. Use machineIdentifier for reliable client control.
     """
     try:
         plex = connect_to_plex()
-        clients = plex.clients()
         
-        # Also get session clients which may not appear in clients()
+        # Get sessions for active playback info
         sessions = plex.sessions()
-        session_clients = []
-        
-        # Extract clients from sessions
+        session_info = {}
         for session in sessions:
             if hasattr(session, 'player') and session.player:
-                session_clients.append(session.player)
+                player = session.player
+                machine_id = getattr(player, 'machineIdentifier', None)
+                if machine_id:
+                    username = "Unknown"
+                    if hasattr(session, 'usernames') and session.usernames:
+                        username = session.usernames[0]
+                    
+                    session_info[machine_id] = {
+                        "user": username,
+                        "media_title": getattr(session, 'title', 'Unknown'),
+                        "media_type": getattr(session, 'type', 'unknown'),
+                        "state": getattr(player, 'state', 'unknown'),
+                        "address": getattr(player, 'address', None)
+                    }
         
-        # Combine both client lists, avoiding duplicates
-        all_clients = clients.copy()
-        client_ids = {client.machineIdentifier for client in clients}
+        # Use myPlexAccount.resources() to find all available players
+        account = plex.myPlexAccount()
+        resources = account.resources()
         
-        for client in session_clients:
-            if hasattr(client, 'machineIdentifier') and client.machineIdentifier not in client_ids:
-                all_clients.append(client)
-                client_ids.add(client.machineIdentifier)
+        result = []
+        for resource in resources:
+            provides = getattr(resource, 'provides', '') or ''
+            # Only include resources that provide player capability
+            if 'player' not in provides.lower():
+                continue
+            
+            machine_id = getattr(resource, 'clientIdentifier', '')
+            resource_name = getattr(resource, 'name', 'Unknown')
+            presence = getattr(resource, 'presence', False)
+            platform = getattr(resource, 'platform', 'Unknown')
+            product = getattr(resource, 'product', 'Unknown')
+            
+            # Get local connection URI
+            local_uri = None
+            if hasattr(resource, 'connections') and resource.connections:
+                for conn in resource.connections:
+                    if getattr(conn, 'local', False):
+                        local_uri = getattr(conn, 'uri', None)
+                        break
+            
+            # Check if this client has an active session
+            info = session_info.get(machine_id, {})
+            state = info.get("state", "idle" if presence else "offline")
+            is_active = state in ("playing", "paused")
+            
+            # Skip non-active clients if active_only is requested
+            if active_only and not is_active:
+                continue
+            
+            if include_details:
+                client_data = {
+                    "machineIdentifier": machine_id,
+                    "name": resource_name,
+                    "online": presence,
+                    "active": is_active,
+                    "user": info.get("user"),
+                    "state": state,
+                    "nowPlaying": info.get("media_title"),
+                    "platform": platform,
+                    "product": product,
+                    "provides": provides,
+                    "address": local_uri or info.get("address"),
+                    "controllable": local_uri is not None and presence
+                }
+                result.append(client_data)
+            else:
+                result.append({
+                    "machineIdentifier": machine_id, 
+                    "name": resource_name,
+                    "online": presence,
+                    "active": is_active
+                })
         
-        if not all_clients:
+        if not result:
             return json.dumps({
                 "status": "success",
-                "message": "No clients currently connected to your Plex server.",
+                "message": "No player clients found in your Plex account.",
                 "count": 0,
                 "clients": []
             })
         
-        result = []
-        if include_details:
-            for client in all_clients:
-                result.append({
-                    "name": client.title,
-                    "device": getattr(client, 'device', 'Unknown'),
-                    "model": getattr(client, "model", "Unknown"),
-                    "product": getattr(client, 'product', 'Unknown'),
-                    "version": getattr(client, 'version', 'Unknown'),
-                    "platform": getattr(client, "platform", "Unknown"),
-                    "state": getattr(client, "state", "Unknown"),
-                    "machineIdentifier": getattr(client, 'machineIdentifier', 'Unknown'),
-                    "address": getattr(client, "_baseurl", "Unknown") or getattr(client, "address", "Unknown"),
-                    "protocolCapabilities": getattr(client, "protocolCapabilities", [])
-                })
-        else:
-            result = [client.title for client in all_clients]
+        # Sort: online first, then by name
+        result.sort(key=lambda x: (not x.get("online", False), x.get("name", "").lower()))
             
         return json.dumps({
             "status": "success",
-            "message": f"Found {len(all_clients)} connected clients",
-            "count": len(all_clients),
+            "message": f"Found {len(result)} player clients",
+            "count": len(result),
+            "note": "Use machineIdentifier or name for client control. Only 'online' clients with an address are controllable.",
             "clients": result
         }, indent=2)
             
@@ -85,7 +227,7 @@ async def client_get_details(client_name: str) -> str:
     """Get detailed information about a specific Plex client.
     
     Args:
-        client_name: Name of the client to get details for
+        client_name: Name or machineIdentifier of the client to get details for
     
     Returns:
         Dictionary containing client details
@@ -93,40 +235,36 @@ async def client_get_details(client_name: str) -> str:
     try:
         plex = connect_to_plex()
         
-        # Get regular clients
-        regular_clients = plex.clients()
+        # Find the client
+        client, session, client_found_name = _find_client(plex, client_name)
         
-        # Also get clients from sessions
-        sessions = plex.sessions()
-        session_clients = []
+        # Use session player info if no controllable client
+        if client is None and session is not None:
+            player = session.player
+            client_details = {
+                "machineIdentifier": getattr(player, 'machineIdentifier', 'Unknown'),
+                "name": getattr(player, 'title', 'Unknown'),
+                "device": getattr(player, 'device', 'Unknown'),
+                "product": getattr(player, 'product', 'Unknown'),
+                "platform": getattr(player, "platform", "Unknown"),
+                "state": getattr(player, "state", "Unknown"),
+                "address": getattr(player, "address", "Unknown"),
+                "controllable": False,
+                "note": "This client is only visible via active session"
+            }
+            return json.dumps({
+                "status": "success",
+                "client": client_details
+            }, indent=2)
         
-        # Extract clients from sessions
-        for session in sessions:
-            if hasattr(session, 'player') and session.player:
-                session_clients.append(session.player)
-        
-        # Try to find the client first in regular clients
-        client = None
-        try:
-            client = plex.client(client_name)
-        except NotFound:
-            # Try to find a client with a matching name in regular clients
-            matching_clients = [c for c in regular_clients if client_name.lower() in c.title.lower()]
-            if matching_clients:
-                client = matching_clients[0]
-            else:
-                # Try to find in session clients
-                matching_session_clients = [c for c in session_clients if 
-                                           hasattr(c, 'title') and client_name.lower() in c.title.lower()]
-                if matching_session_clients:
-                    client = matching_session_clients[0]
-                else:
-                    return json.dumps({
-                        "status": "error",
-                        "message": f"No client found matching '{client_name}'"
-                    })
+        if client is None:
+            return json.dumps({
+                "status": "error",
+                "message": f"No client found matching '{client_name}'. Use client_list to see available clients."
+            })
             
         client_details = {
+            "machineIdentifier": getattr(client, 'machineIdentifier', 'Unknown'),
             "name": client.title,
             "device": getattr(client, 'device', 'Unknown'),
             "deviceClass": getattr(client, "deviceClass", "Unknown"),
@@ -136,13 +274,13 @@ async def client_get_details(client_name: str) -> str:
             "platform": getattr(client, "platform", "Unknown"),
             "platformVersion": getattr(client, "platformVersion", "Unknown"),
             "state": getattr(client, "state", "Unknown"),
-            "machineIdentifier": getattr(client, 'machineIdentifier', 'Unknown'),
             "protocolCapabilities": getattr(client, "protocolCapabilities", []),
-            "address": getattr(client, "_baseurl", "Unknown") or getattr(client, "address", "Unknown"),
-            "local": getattr(client, "local", "Unknown"),
+            "address": getattr(client, "address", None) or getattr(client, "_baseurl", "Unknown"),
+            "local": getattr(client, "local", None),
             "protocol": getattr(client, "protocol", "plex"),
             "protocolVersion": getattr(client, "protocolVersion", "Unknown"),
             "vendor": getattr(client, "vendor", "Unknown"),
+            "controllable": True
         }
         
         return json.dumps({
@@ -161,7 +299,7 @@ async def client_get_timelines(client_name: str) -> str:
     """Get the current timeline information for a specific Plex client.
     
     Args:
-        client_name: Name of the client to get timeline for
+        client_name: Name or machineIdentifier of the client to get timeline for
     
     Returns:
         Timeline information for the client
@@ -169,81 +307,70 @@ async def client_get_timelines(client_name: str) -> str:
     try:
         plex = connect_to_plex()
         
-        # Get regular clients
-        regular_clients = plex.clients()
+        # Find the client
+        client, session, client_found_name = _find_client(plex, client_name)
         
-        # Also get clients from sessions
-        sessions = plex.sessions()
-        session_clients = []
+        # If we only have a session (no controllable client), use session info
+        if client is None and session is not None:
+            session_data = {
+                "state": getattr(session.player, 'state', 'Unknown'),
+                "time": getattr(session, 'viewOffset', 0),
+                "duration": getattr(session, 'duration', 0),
+                "progress": round((session.viewOffset / session.duration * 100) if hasattr(session, 'viewOffset') and 
+                                   hasattr(session, 'duration') and session.duration else 0, 2),
+                "title": getattr(session, 'title', 'Unknown'),
+                "type": getattr(session, 'type', 'Unknown'),
+            }
+            return json.dumps({
+                "status": "success",
+                "client_name": client_found_name,
+                "source": "session",
+                "timeline": session_data
+            }, indent=2)
         
-        # Extract clients from sessions
-        for session in sessions:
-            if hasattr(session, 'player') and session.player:
-                session_clients.append(session.player)
-        
-        # Try to find the client first in regular clients
-        client = None
-        try:
-            client = plex.client(client_name)
-        except NotFound:
-            # Try to find a client with a matching name in regular clients
-            matching_clients = [c for c in regular_clients if client_name.lower() in c.title.lower()]
-            if matching_clients:
-                client = matching_clients[0]
-            else:
-                # Try to find in session clients
-                matching_session_clients = [c for c in session_clients if 
-                                           hasattr(c, 'title') and client_name.lower() in c.title.lower()]
-                if matching_session_clients:
-                    client = matching_session_clients[0]
-                else:
-                    return json.dumps({
-                        "status": "error",
-                        "message": f"No client found matching '{client_name}'"
-                    })
+        if client is None:
+            return json.dumps({
+                "status": "error",
+                "message": f"No client found matching '{client_name}'. Use client_list to see available clients."
+            })
             
-        # Some clients may not always respond to timeline requests
+        # Try to get timeline from client
         try:
             timeline = client.timeline
             
-            # If timeline is None, the client might not be actively playing anything
             if timeline is None:
                 # Check if this client has an active session
-                for session in sessions:
-                    if (hasattr(session, 'player') and session.player and 
-                       hasattr(session.player, 'machineIdentifier') and 
-                       hasattr(client, 'machineIdentifier') and
-                       session.player.machineIdentifier == client.machineIdentifier):
-                        # Use session information instead
+                sessions = plex.sessions()
+                for s in sessions:
+                    if (hasattr(s, 'player') and s.player and 
+                       getattr(s.player, 'machineIdentifier', '') == getattr(client, 'machineIdentifier', '')):
                         session_data = {
-                            "state": session.player.state if hasattr(session.player, 'state') else "Unknown",
-                            "time": session.viewOffset if hasattr(session, 'viewOffset') else 0,
-                            "duration": session.duration if hasattr(session, 'duration') else 0,
-                            "progress": round((session.viewOffset / session.duration * 100) if hasattr(session, 'viewOffset') and 
-                                               hasattr(session, 'duration') and session.duration else 0, 2),
-                            "title": session.title if hasattr(session, 'title') else "Unknown",
-                            "type": session.type if hasattr(session, 'type') else "Unknown",
+                            "state": getattr(s.player, 'state', 'Unknown'),
+                            "time": getattr(s, 'viewOffset', 0),
+                            "duration": getattr(s, 'duration', 0),
+                            "progress": round((s.viewOffset / s.duration * 100) if s.duration else 0, 2),
+                            "title": getattr(s, 'title', 'Unknown'),
+                            "type": getattr(s, 'type', 'Unknown'),
                         }
-                        
                         return json.dumps({
                             "status": "success",
-                            "client_name": client.title,
+                            "client_name": client_found_name,
                             "source": "session",
                             "timeline": session_data
                         }, indent=2)
                 
                 return json.dumps({
                     "status": "info",
-                    "message": f"Client '{client.title}' is not currently playing any media.",
-                    "client_name": client.title
+                    "message": f"Client '{client_found_name}' is not currently playing any media.",
+                    "client_name": client_found_name
                 })
                 
             # Process timeline data
             timeline_data = {
-                "type": timeline.type,
-                "state": timeline.state,
-                "time": timeline.time,
-                "duration": timeline.duration,
+                "type": getattr(timeline, 'type', 'Unknown'),
+                "state": getattr(timeline, 'state', 'Unknown'),
+                "time": getattr(timeline, 'time', 0),
+                "duration": getattr(timeline, 'duration', 0),
                 "progress": round((timeline.time / timeline.duration * 100) if timeline.duration else 0, 2),
                 "key": getattr(timeline, "key", None),
                 "ratingKey": getattr(timeline, "ratingKey", None),
@@ -259,39 +386,35 @@ async def client_get_timelines(client_name: str) -> str:
             
             return json.dumps({
                 "status": "success",
-                "client_name": client.title,
+                "client_name": client_found_name,
                 "source": "timeline",
                 "timeline": timeline_data
             }, indent=2)
-        except:
-            # Check if there's an active session for this client
-            for session in sessions:
-                if (hasattr(session, 'player') and session.player and 
-                    hasattr(session.player, 'machineIdentifier') and 
-                    hasattr(client, 'machineIdentifier') and
-                    session.player.machineIdentifier == client.machineIdentifier):
-                    # Use session information instead
+        except Exception:
+            # Fallback to session info
+            sessions = plex.sessions()
+            for s in sessions:
+                if (hasattr(s, 'player') and s.player and 
+                    getattr(s.player, 'machineIdentifier', '') == getattr(client, 'machineIdentifier', '')):
                     session_data = {
-                        "state": session.player.state if hasattr(session.player, 'state') else "Unknown",
-                        "time": session.viewOffset if hasattr(session, 'viewOffset') else 0,
-                        "duration": session.duration if hasattr(session, 'duration') else 0,
-                        "progress": round((session.viewOffset / session.duration * 100) if hasattr(session, 'viewOffset') and 
-                                           hasattr(session, 'duration') and session.duration else 0, 2),
-                        "title": session.title if hasattr(session, 'title') else "Unknown",
-                        "type": session.type if hasattr(session, 'type') else "Unknown",
+                        "state": getattr(s.player, 'state', 'Unknown'),
+                        "time": getattr(s, 'viewOffset', 0),
+                        "duration": getattr(s, 'duration', 0),
+                        "progress": round((s.viewOffset / s.duration * 100) if s.duration else 0, 2),
+                        "title": getattr(s, 'title', 'Unknown'),
+                        "type": getattr(s, 'type', 'Unknown'),
                     }
-                    
                     return json.dumps({
                         "status": "success",
-                        "client_name": client.title,
+                        "client_name": client_found_name,
                         "source": "session",
                         "timeline": session_data
                     }, indent=2)
             
             return json.dumps({
                 "status": "warning",
-                "message": f"Unable to get timeline information for client '{client.title}'. The client may not be responding to timeline requests.",
-                "client_name": client.title
+                "message": f"Unable to get timeline information for client '{client_found_name}'. The client may not be responding.",
+                "client_name": client_found_name
             })
             
     except Exception as e:
@@ -301,198 +424,159 @@ async def client_get_timelines(client_name: str) -> str:
         })
 
 @mcp.tool()
-async def client_get_active() -> str:
-    """Get all clients that are currently playing media.
-    
-    Returns:
-        List of active clients with their playback status
-    """
-    try:
-        plex = connect_to_plex()
-        
-        # Get all sessions
-        sessions = plex.sessions()
-        
-        if not sessions:
-            return json.dumps({
-                "status": "success",
-                "message": "No active playback sessions found.",
-                "count": 0,
-                "active_clients": []
-            })
-        
-        active_clients = []
-        
-        for session in sessions:
-            if hasattr(session, 'player') and session.player:
-                player = session.player
-                
-                # Get media information
-                media_info = {
-                    "title": session.title if hasattr(session, 'title') else "Unknown",
-                    "type": session.type if hasattr(session, 'type') else "Unknown",
-                }
-                
-                # Add additional info based on media type
-                if hasattr(session, 'type'):
-                    if session.type == 'episode':
-                        media_info["show"] = getattr(session, 'grandparentTitle', 'Unknown Show')
-                        media_info["season"] = getattr(session, 'parentTitle', 'Unknown Season')
-                        media_info["seasonEpisode"] = f"S{getattr(session, 'parentIndex', '?')}E{getattr(session, 'index', '?')}"
-                    elif session.type == 'movie':
-                        media_info["year"] = getattr(session, 'year', 'Unknown')
-                
-                # Calculate progress if possible
-                progress = None
-                if hasattr(session, 'viewOffset') and hasattr(session, 'duration') and session.duration:
-                    progress = round((session.viewOffset / session.duration) * 100, 1)
-                
-                # Get user info
-                username = "Unknown User"
-                if hasattr(session, 'usernames') and session.usernames:
-                    username = session.usernames[0]
-                
-                # Get transcoding status
-                transcoding = False
-                if hasattr(session, 'transcodeSessions') and session.transcodeSessions:
-                    transcoding = True
-                
-                client_info = {
-                    "name": player.title,
-                    "device": getattr(player, 'device', 'Unknown'),
-                    "product": getattr(player, 'product', 'Unknown'),
-                    "platform": getattr(player, 'platform', 'Unknown'),
-                    "state": getattr(player, 'state', 'Unknown'),
-                    "user": username,
-                    "media": media_info,
-                    "progress": progress,
-                    "transcoding": transcoding
-                }
-                
-                active_clients.append(client_info)
-        
-        return json.dumps({
-            "status": "success",
-            "message": f"Found {len(active_clients)} active clients",
-            "count": len(active_clients),
-            "active_clients": active_clients
-        }, indent=2)
-        
-    except Exception as e:
-        return json.dumps({
-            "status": "error",
-            "message": f"Error getting active clients: {str(e)}"
-        })
-
-@mcp.tool()
-async def client_start_playback(media_title: str, client_name: str = None, 
+async def client_start_playback(media_title: str = None, client_name: str = None, 
                         offset: int = 0, library_name: str = None, 
-                        use_external_player: bool = False) -> str:
+                        use_external_player: bool = False,
+                        rating_key: int = None) -> str:
     """Start playback of media on a specified client.
     
     Args:
-        media_title: Title of the media to play
+        media_title: Title of the media to play (optional if rating_key is provided)
         client_name: Optional name of the client to play on (will prompt if not provided)
         offset: Optional time offset in milliseconds to start from
         library_name: Optional name of the library to search in
         use_external_player: Whether to use the client's external player
+        rating_key: Optional specific rating key (ID) of the media to play
     """
     try:
         plex = connect_to_plex()
         
         # First, find the media item
-        results = []
-        if library_name:
+        media = None
+        if rating_key:
             try:
-                library = plex.library.section(library_name)
-                results = library.search(title=media_title)
-            except Exception:
+                media = plex.fetchItem(rating_key)
+            except Exception as e:
                 return json.dumps({
                     "status": "error",
-                    "message": f"Library '{library_name}' not found"
+                    "message": f"Media not found for rating key {rating_key}: {str(e)}"
                 })
+        elif media_title:
+            results = []
+            if library_name:
+                try:
+                    library = plex.library.section(library_name)
+                    results = library.search(title=media_title)
+                except Exception:
+                    return json.dumps({
+                        "status": "error",
+                        "message": f"Library '{library_name}' not found"
+                    })
+            else:
+                results = plex.search(media_title)
+            
+            if not results:
+                return json.dumps({
+                    "status": "error",
+                    "message": f"No media found matching '{media_title}'"
+                })
+            
+            if len(results) > 1:
+                # If multiple results, provide information about them
+                media_list = []
+                for i, m in enumerate(results[:10], 1):  # Limit to first 10 to avoid overwhelming
+                    m_media_type = getattr(m, 'type', 'unknown')
+                    m_title = getattr(m, 'title', 'Unknown')
+                    m_year = getattr(m, 'year', '')
+                    
+                    media_info = {
+                        "index": i,
+                        "title": m_title,
+                        "type": m_media_type,
+                        "rating_key": getattr(m, 'ratingKey', None)
+                    }
+                    
+                    if m_year:
+                        media_info["year"] = m_year
+                    
+                    if m_media_type == 'episode':
+                        m_show = getattr(m, 'grandparentTitle', 'Unknown Show')
+                        m_season = getattr(m, 'parentIndex', '?')
+                        m_episode = getattr(m, 'index', '?')
+                        media_info["show"] = m_show
+                        media_info["season"] = m_season
+                        media_info["episode"] = m_episode
+                    
+                    media_list.append(media_info)
+                
+                return json.dumps({
+                    "status": "multiple_results",
+                    "message": f"Multiple items found matching '{media_title}'. Please specify a library or use a more specific title, or use rating_key.",
+                    "count": len(results),
+                    "results": media_list
+                }, indent=2)
+            
+            media = results[0]
         else:
-            results = plex.search(media_title)
-        
-        if not results:
             return json.dumps({
                 "status": "error",
-                "message": f"No media found matching '{media_title}'"
+                "message": "Either media_title or rating_key must be provided."
             })
-        
-        if len(results) > 1:
-            # If multiple results, provide information about them
-            media_list = []
-            for i, media in enumerate(results[:10], 1):  # Limit to first 10 to avoid overwhelming
-                media_type = getattr(media, 'type', 'unknown')
-                title = getattr(media, 'title', 'Unknown')
-                year = getattr(media, 'year', '')
-                
-                media_info = {
-                    "index": i,
-                    "title": title,
-                    "type": media_type,
-                }
-                
-                if year:
-                    media_info["year"] = year
-                
-                if media_type == 'episode':
-                    show = getattr(media, 'grandparentTitle', 'Unknown Show')
-                    season = getattr(media, 'parentIndex', '?')
-                    episode = getattr(media, 'index', '?')
-                    media_info["show"] = show
-                    media_info["season"] = season
-                    media_info["episode"] = episode
-                
-                media_list.append(media_info)
-            
-            return json.dumps({
-                "status": "multiple_results",
-                "message": f"Multiple items found matching '{media_title}'. Please specify a library or use a more specific title.",
-                "count": len(results),
-                "results": media_list
-            }, indent=2)
-        
-        media = results[0]
         
         # If no client name specified, list available clients
         if not client_name:
-            clients = plex.clients()
-            
-            if not clients:
+            try:
+                account = plex.myPlexAccount()
+                resources = account.resources()
+                
+                client_list = []
+                for r in resources:
+                    provides = getattr(r, 'provides', '') or ''
+                    if 'player' not in provides.lower():
+                        continue
+                    presence = getattr(r, 'presence', False)
+                    if presence:  # Only show online clients
+                        local_uri = None
+                        if hasattr(r, 'connections') and r.connections:
+                            for conn in r.connections:
+                                if getattr(conn, 'local', False):
+                                    local_uri = conn.uri
+                                    break
+                        if local_uri:
+                            client_list.append({
+                                "name": r.name,
+                                "platform": getattr(r, 'platform', 'Unknown')
+                            })
+                
+                if not client_list:
+                    return json.dumps({
+                        "status": "error",
+                        "message": "No controllable clients are currently online."
+                    })
+                
+                return json.dumps({
+                    "status": "client_selection",
+                    "message": "Please specify a client to play on using the client_name parameter",
+                    "available_clients": client_list
+                }, indent=2)
+            except Exception as e:
                 return json.dumps({
                     "status": "error",
-                    "message": "No clients are currently connected to your Plex server."
+                    "message": f"Error discovering clients: {str(e)}"
                 })
-            
-            client_list = []
-            for i, client in enumerate(clients, 1):
-                client_list.append({
-                    "index": i,
-                    "name": client.title,
-                    "device": getattr(client, 'device', 'Unknown')
-                })
-            
-            return json.dumps({
-                "status": "client_selection",
-                "message": "Please specify a client to play on using the client_name parameter",
-                "available_clients": client_list
-            }, indent=2)
         
         # Try to find the client
-        try:
-            client = plex.client(client_name)
-        except NotFound:
-            # Try to find a client with a matching name
-            matching_clients = [c for c in plex.clients() if client_name.lower() in c.title.lower()]
-            if matching_clients:
-                client = matching_clients[0]
-            else:
+        client, session, client_found_name = _find_client(plex, client_name)
+        
+        if client is None:
+            if session is not None:
                 return json.dumps({
                     "status": "error",
-                    "message": f"No client found matching '{client_name}'"
+                    "message": f"Client '{client_found_name}' does not support playback control. Only session stop is available."
                 })
+            return json.dumps({
+                "status": "error",
+                "message": f"No client found matching '{client_name}'. Use client_list to see available clients."
+            })
+        
+        # STOP current playback if session exists to ensure a clean transition
+        if session:
+            try:
+                client.stop()
+                await asyncio.sleep(1)
+            except Exception:
+                # Continue if stop fails (client might already be idle but session still active)
+                pass
         
         # Start playback
         media_type = getattr(media, 'type', 'unknown')
@@ -510,12 +594,13 @@ async def client_start_playback(media_title: str, client_name: str = None,
         try:
             if use_external_player:
                 # Open in external player if supported by client
-                if "Player" in client.protocolCapabilities:
+                capabilities = getattr(client, 'protocolCapabilities', []) or []
+                if "Player" in capabilities:
                     media.playOn(client)
                 else:
                     return json.dumps({
                         "status": "error",
-                        "message": f"Client '{client.title}' does not support external player"
+                        "message": f"Client '{client_found_name}' does not support external player"
                     })
             else:
                 # Normal playback
@@ -523,14 +608,14 @@ async def client_start_playback(media_title: str, client_name: str = None,
             
             return json.dumps({
                 "status": "success",
-                "message": f"Started playback of '{formatted_title}' on {client.title}",
+                "message": f"Started playback of '{formatted_title}' on {client_found_name}",
                 "media": {
                     "title": title,
                     "type": media_type,
                     "formatted_title": formatted_title,
                     "rating_key": getattr(media, 'ratingKey', None)
                 },
-                "client": client.title,
+                "client": client_found_name,
                 "offset": offset
             }, indent=2)
         except Exception as e:
@@ -551,7 +636,7 @@ async def client_control_playback(client_name: str, action: str,
     """Control playback on a specified client.
     
     Args:
-        client_name: Name of the client to control
+        client_name: Name of the client to control (use machine identifier or title from client_list)
         action: Action to perform (play, pause, stop, skipNext, skipPrevious, 
                 stepForward, stepBack, seekTo, seekForward, seekBack, mute, unmute, setVolume)
         parameter: Parameter for actions that require it (like setVolume or seekTo)
@@ -589,64 +674,101 @@ async def client_control_playback(client_name: str, action: str,
                 "message": f"Invalid media type '{media_type}'. Valid types are: {', '.join(valid_media_types)}"
             })
         
-        # Try to find the client
-        try:
-            client = plex.client(client_name)
-        except NotFound:
-            # Try to find a client with a matching name
-            matching_clients = [c for c in plex.clients() if client_name.lower() in c.title.lower()]
-            if matching_clients:
-                client = matching_clients[0]
+        # Find the client using the centralized lookup
+        client, session, client_found_name = _find_client(plex, client_name)
+        
+        # If we found a session but no controllable client
+        if client is None and session is not None:
+            # Limited actions available via session
+            if action == 'stop':
+                try:
+                    session.stop(reason='Stopped via Plex MCP Server')
+                    return json.dumps({
+                        "status": "success",
+                        "message": f"Successfully stopped playback on '{client_found_name}'",
+                        "action": action,
+                        "client": client_found_name,
+                        "note": "Session terminated (client does not support direct playback control)"
+                    }, indent=2)
+                except Exception as e:
+                    return json.dumps({
+                        "status": "error",
+                        "message": f"Error stopping session: {str(e)}"
+                    })
             else:
                 return json.dumps({
                     "status": "error",
-                    "message": f"No client found matching '{client_name}'"
+                    "message": f"Client '{client_found_name}' is playing but does not support direct playback control. Only 'stop' is available for this client.",
+                    "available_actions": ["stop"],
+                    "note": "This client is visible in sessions but not controllable. It may not be advertising its control endpoint to the server."
                 })
         
-        # Check if the client has playback control capability
-        if "playback" not in client.protocolCapabilities:
+        # If no client found at all
+        if client is None:
             return json.dumps({
                 "status": "error",
-                "message": f"Client '{client.title}' does not support playback control."
+                "message": f"No client found matching '{client_name}'. Use client_list to see available clients."
             })
+        
+        # Check if the client has playback control capability
+        capabilities = getattr(client, 'protocolCapabilities', []) or []
+        if isinstance(capabilities, str):
+            capabilities = [capabilities]
+        
+        # Some clients don't report capabilities but still work
+        # So we'll try anyway and catch errors
         
         # Perform the requested action
         try:
             # Transport controls
             if action == 'play':
-                client.play()
+                client.play(mtype=media_type)
             elif action == 'pause':
-                client.pause()
+                client.pause(mtype=media_type)
             elif action == 'stop':
-                client.stop()
+                client.stop(mtype=media_type)
             elif action == 'skipNext':
-                client.skipNext()
+                client.skipNext(mtype=media_type)
             elif action == 'skipPrevious':
-                client.skipPrevious()
+                client.skipPrevious(mtype=media_type)
             elif action == 'stepForward':
-                client.stepForward()
+                client.stepForward(mtype=media_type)
             elif action == 'stepBack':
-                client.stepBack()
+                client.stepBack(mtype=media_type)
             
             # Seeking
             elif action == 'seekTo':
                 # Parameter should be milliseconds
-                client.seekTo(parameter)
+                client.seekTo(parameter, mtype=media_type)
             elif action == 'seekForward':
                 # Default to 30 seconds if no parameter
                 seconds = parameter if parameter is not None else 30
-                client.seekTo(client.timeline.time + (seconds * 1000))
+                try:
+                    current_time = client.timeline.time if client.timeline else 0
+                    client.seekTo(current_time + (seconds * 1000), mtype=media_type)
+                except:
+                    return json.dumps({
+                        "status": "error",
+                        "message": "Unable to get current playback position for seeking forward"
+                    })
             elif action == 'seekBack':
                 # Default to 30 seconds if no parameter
                 seconds = parameter if parameter is not None else 30
-                seek_time = max(0, client.timeline.time - (seconds * 1000))
-                client.seekTo(seek_time)
+                try:
+                    current_time = client.timeline.time if client.timeline else 0
+                    seek_time = max(0, current_time - (seconds * 1000))
+                    client.seekTo(seek_time, mtype=media_type)
+                except:
+                    return json.dumps({
+                        "status": "error",
+                        "message": "Unable to get current playback position for seeking back"
+                    })
             
             # Volume controls
             elif action == 'mute':
-                client.mute()
+                client.setVolume(0, mtype=media_type)
             elif action == 'unmute':
-                client.unmute()
+                client.setVolume(100, mtype=media_type)
             elif action == 'setVolume':
                 # Parameter should be 0-100
                 if parameter < 0 or parameter > 100:
@@ -654,33 +776,31 @@ async def client_control_playback(client_name: str, action: str,
                         "status": "error",
                         "message": "Volume must be between 0 and 100"
                     })
-                client.setVolume(parameter)
+                client.setVolume(parameter, mtype=media_type)
             
             # Check timeline to confirm the action (may take a moment to update)
             time.sleep(0.5)  # Give a short delay for state to update
             
             # Get updated timeline info
-            timeline = None
+            timeline_data = None
             try:
                 timeline = client.timeline
                 if timeline:
                     timeline_data = {
-                        "state": timeline.state,
-                        "time": timeline.time,
-                        "duration": timeline.duration,
+                        "state": getattr(timeline, "state", "unknown"),
+                        "time": getattr(timeline, "time", 0),
+                        "duration": getattr(timeline, "duration", 0),
                         "volume": getattr(timeline, "volume", None),
                         "muted": getattr(timeline, "muted", None)
                     }
-                else:
-                    timeline_data = None
             except:
-                timeline_data = None
+                pass
             
             return json.dumps({
                 "status": "success",
-                "message": f"Successfully performed action '{action}' on client '{client.title}'",
+                "message": f"Successfully performed action '{action}' on client '{client_found_name}'",
                 "action": action,
-                "client": client.title,
+                "client": client_found_name,
                 "parameter": parameter,
                 "timeline": timeline_data
             }, indent=2)
@@ -702,7 +822,7 @@ async def client_navigate(client_name: str, action: str) -> str:
     """Navigate a Plex client interface.
     
     Args:
-        client_name: Name of the client to navigate
+        client_name: Name or machineIdentifier of the client to navigate
         action: Navigation action to perform (moveUp, moveDown, moveLeft, moveRight, 
                 select, back, home, contextMenu)
     """
@@ -721,25 +841,26 @@ async def client_navigate(client_name: str, action: str) -> str:
                 "message": f"Invalid navigation action '{action}'. Valid actions are: {', '.join(valid_actions)}"
             })
         
-        # Try to find the client
-        try:
-            client = plex.client(client_name)
-        except NotFound:
-            # Try to find a client with a matching name
-            matching_clients = [c for c in plex.clients() if client_name.lower() in c.title.lower()]
-            if matching_clients:
-                client = matching_clients[0]
-            else:
+        # Find the client
+        client, session, client_found_name = _find_client(plex, client_name)
+        
+        if client is None:
+            if session is not None:
                 return json.dumps({
                     "status": "error",
-                    "message": f"No client found matching '{client_name}'"
+                    "message": f"Client '{client_found_name}' does not support navigation control."
                 })
-        
-        # Check if the client has navigation capability
-        if "navigation" not in client.protocolCapabilities:
             return json.dumps({
                 "status": "error",
-                "message": f"Client '{client.title}' does not support navigation control."
+                "message": f"No client found matching '{client_name}'. Use client_list to see available clients."
+            })
+        
+        # Check if the client has navigation capability
+        capabilities = getattr(client, 'protocolCapabilities', []) or []
+        if "navigation" not in capabilities:
+            return json.dumps({
+                "status": "error",
+                "message": f"Client '{client_found_name}' does not support navigation control."
             })
         
         # Perform the requested action
@@ -763,9 +884,9 @@ async def client_navigate(client_name: str, action: str) -> str:
             
             return json.dumps({
                 "status": "success",
-                "message": f"Successfully performed navigation action '{action}' on client '{client.title}'",
+                "message": f"Successfully performed navigation action '{action}' on client '{client_found_name}'",
                 "action": action,
-                "client": client.title
+                "client": client_found_name
             }, indent=2)
             
         except Exception as e:
@@ -786,7 +907,7 @@ async def client_set_streams(client_name: str, audio_stream_id: str = None,
     """Set audio, subtitle, or video streams for current playback on a client.
     
     Args:
-        client_name: Name of the client to set streams for
+        client_name: Name or machineIdentifier of the client to set streams for
         audio_stream_id: ID of the audio stream to switch to
         subtitle_stream_id: ID of the subtitle stream to switch to, use '0' to disable
         video_stream_id: ID of the video stream to switch to
@@ -801,46 +922,44 @@ async def client_set_streams(client_name: str, audio_stream_id: str = None,
                 "message": "At least one stream ID (audio, subtitle, or video) must be provided."
             })
         
-        # Try to find the client
-        try:
-            client = plex.client(client_name)
-        except NotFound:
-            # Try to find a client with a matching name
-            matching_clients = [c for c in plex.clients() if client_name.lower() in c.title.lower()]
-            if matching_clients:
-                client = matching_clients[0]
-            else:
+        # Find the client
+        client, session, client_found_name = _find_client(plex, client_name)
+        
+        if client is None:
+            if session is not None:
                 return json.dumps({
                     "status": "error",
-                    "message": f"No client found matching '{client_name}'"
+                    "message": f"Client '{client_found_name}' does not support stream selection."
                 })
+            return json.dumps({
+                "status": "error",
+                "message": f"No client found matching '{client_name}'. Use client_list to see available clients."
+            })
         
         # Check if client is currently playing
-        timeline = None
         try:
             timeline = client.timeline
             if timeline is None or not hasattr(timeline, 'state') or timeline.state != 'playing':
                 # Check active sessions to see if this client has a session
                 sessions = plex.sessions()
                 client_session = None
+                client_machine_id = getattr(client, 'machineIdentifier', '')
                 
-                for session in sessions:
-                    if (hasattr(session, 'player') and session.player and 
-                        hasattr(session.player, 'machineIdentifier') and 
-                        hasattr(client, 'machineIdentifier') and
-                        session.player.machineIdentifier == client.machineIdentifier):
-                        client_session = session
+                for s in sessions:
+                    if (hasattr(s, 'player') and s.player and 
+                        getattr(s.player, 'machineIdentifier', '') == client_machine_id):
+                        client_session = s
                         break
                 
                 if not client_session:
                     return json.dumps({
                         "status": "error",
-                        "message": f"Client '{client.title}' is not currently playing any media."
+                        "message": f"Client '{client_found_name}' is not currently playing any media."
                     })
-        except:
+        except Exception:
             return json.dumps({
                 "status": "error",
-                "message": f"Unable to get playback status for client '{client.title}'."
+                "message": f"Unable to get playback status for client '{client_found_name}'."
             })
         
         # Set streams
@@ -860,8 +979,8 @@ async def client_set_streams(client_name: str, audio_stream_id: str = None,
             
             return json.dumps({
                 "status": "success",
-                "message": f"Successfully set streams for '{client.title}': {', '.join(changed_streams)}",
-                "client": client.title,
+                "message": f"Successfully set streams for '{client_found_name}': {', '.join(changed_streams)}",
+                "client": client_found_name,
                 "changes": {
                     "audio_stream": audio_stream_id if audio_stream_id is not None else None,
                     "subtitle_stream": subtitle_stream_id if subtitle_stream_id is not None else None,
@@ -878,4 +997,4 @@ async def client_set_streams(client_name: str, audio_stream_id: str = None,
         return json.dumps({
             "status": "error",
             "message": f"Error setting up stream selection: {str(e)}"
-        }) 
+        })
