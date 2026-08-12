@@ -1,6 +1,7 @@
 import argparse
 import os
 import json
+import re
 import uvicorn # type: ignore
 from starlette.applications import Starlette # type: ignore
 from starlette.routing import Mount, Route # type: ignore
@@ -9,6 +10,7 @@ from starlette.middleware import Middleware # type: ignore
 from mcp.server import Server # type: ignore
 from mcp.server.sse import SseServerTransport # type: ignore
 from mcp.server.fastmcp.server import StreamableHTTPASGIApp # type: ignore
+from mcp.server.transport_security import TransportSecuritySettings # type: ignore
 from starlette.requests import Request # type: ignore
 from dotenv import load_dotenv # type: ignore
 
@@ -215,6 +217,52 @@ async def handle_authorization_server_metadata(request: Request):
         return JSONResponse({"error": f"Failed to connect to Authentik: {str(e)}"}, status_code=502)
 
 
+def _expand_host_patterns(values):
+    """Expand a comma-separated host list into Host header match patterns.
+
+    The MCP SDK matches the Host header exactly, or against a "host:*" wildcard.
+    A bare hostname therefore does not match a request that carries a port, so
+    each entry is registered both ways and callers only list the hostname.
+    """
+    patterns = []
+    for value in values.split(','):
+        value = value.strip()
+        if not value:
+            continue
+        patterns.append(value)
+        if not value.endswith(':*') and not re.search(r':\d+$', value):
+            patterns.append(f"{value}:*")
+    return patterns
+
+
+def configure_transport_security():
+    """Apply MCP_ALLOWED_HOSTS/MCP_ALLOWED_ORIGINS to the streamable-http transport.
+
+    The SDK enables DNS rebinding protection by default and only trusts loopback
+    Host headers, so any deployment behind a reverse proxy or Kubernetes Service
+    must declare the hostnames it is reached by or every request fails with 421.
+    Setting either variable to "*" disables the check entirely.
+    """
+    allowed_hosts = os.environ.get('MCP_ALLOWED_HOSTS', '').strip()
+    allowed_origins = os.environ.get('MCP_ALLOWED_ORIGINS', '').strip()
+    if not allowed_hosts and not allowed_origins:
+        return
+
+    security = mcp.settings.transport_security or TransportSecuritySettings()
+
+    if allowed_hosts == '*' or allowed_origins == '*':
+        security.enable_dns_rebinding_protection = False
+        print("Warning: DNS rebinding protection disabled via '*'")
+    else:
+        if allowed_hosts:
+            security.allowed_hosts = list(security.allowed_hosts) + _expand_host_patterns(allowed_hosts)
+        if allowed_origins:
+            security.allowed_origins = list(security.allowed_origins) + _expand_host_patterns(allowed_origins)
+        print(f"Allowed hosts: {security.allowed_hosts}")
+
+    mcp.settings.transport_security = security
+
+
 def create_starlette_app(mcp_server: Server, debug: bool = False, transport: str = 'sse'):
     """Create a Starlette application that serves the provided mcp server.
 
@@ -226,6 +274,8 @@ def create_starlette_app(mcp_server: Server, debug: bool = False, transport: str
     if transport == 'streamable-http':
         # Building FastMCP's own app lazily creates the session manager, which we
         # then serve ourselves so the endpoint sits behind our OAuth middleware.
+        # Security settings are read when the manager is built, so apply them first.
+        configure_transport_security()
         mcp.streamable_http_app()
         routes = [
             Route(mcp.settings.streamable_http_path,
@@ -344,6 +394,13 @@ def main():
     parser.add_argument('--port', type=int, default=int(os.environ.get('MCP_PORT', '3001')),
                         help='Port to listen on (for sse/streamable-http, default: MCP_PORT env var or 3001)')
     parser.add_argument('--debug', action='store_true', help='Enable debug mode')
+    parser.add_argument('--allowed-hosts', default=os.environ.get('MCP_ALLOWED_HOSTS'),
+                        help='Comma-separated Host header values to accept on streamable-http, '
+                             'in addition to loopback (default: MCP_ALLOWED_HOSTS env var). '
+                             'Required when serving behind a proxy; "*" disables the check')
+    parser.add_argument('--allowed-origins', default=os.environ.get('MCP_ALLOWED_ORIGINS'),
+                        help='Comma-separated Origin header values to accept on streamable-http '
+                             '(default: MCP_ALLOWED_ORIGINS env var)')
     
     # Plex configuration arguments
     parser.add_argument('--plex-url', default=os.environ.get('PLEX_URL'), 
@@ -374,6 +431,12 @@ def main():
     if args.plex_token:
         os.environ['PLEX_TOKEN'] = args.plex_token
     
+    # Apply transport security configuration from command line
+    if args.allowed_hosts:
+        os.environ['MCP_ALLOWED_HOSTS'] = args.allowed_hosts
+    if args.allowed_origins:
+        os.environ['MCP_ALLOWED_ORIGINS'] = args.allowed_origins
+
     # Apply OAuth configuration from command line
     if args.oauth_enabled:
         os.environ['MCP_OAUTH_ENABLED'] = 'true'

@@ -64,6 +64,21 @@ environment variables) and the same OAuth handling described below.
 plex-mcp-server --transport streamable-http --host 0.0.0.0 --port 3001
 ```
 
+### Serving streamable-http behind a proxy
+
+The MCP SDK enables DNS rebinding protection on the streamable-http transport and trusts only
+loopback `Host` headers, so a server reached by any other hostname answers `421 Misdirected
+Request` until that hostname is declared:
+
+```bash
+plex-mcp-server --transport streamable-http --allowed-hosts mcp.example.com,plex.internal
+```
+
+| Variable | Equivalent flag | Purpose |
+|----------|-----------------|---------|
+| `MCP_ALLOWED_HOSTS` | `--allowed-hosts` | Comma-separated `Host` values to accept, in addition to loopback. Each entry matches with or without a port. `*` disables the check. |
+| `MCP_ALLOWED_ORIGINS` | `--allowed-origins` | Comma-separated `Origin` values to accept from browser clients. |
+
 ## Configuration
 
 Set your Plex server URL and Token using one of these methods:
